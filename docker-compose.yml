@@ -10,6 +10,8 @@ services:
       BATCH_SIZE: "4"         # max images per batch
       BATCH_WAIT_MS: "50"     # idle model waits at most 50 ms to fill a batch
       # Demo knob: simulate slow inference (ms). Submit/query/cancel stay
-      # responsive regardless. Set e.g. "2000" to see the effect.
-      INFERENCE_DELAY_MS: "0"
+      # responsive regardless. 2000 lets /docs show POST/GET /drain observing
+      # "model_computing" then flipping to ready_to_shutdown. Set "0" for the
+      # zero-delay default behaviour.
+      INFERENCE_DELAY_MS: "2000"
     restart: unless-stopped

@@ -5,6 +5,8 @@ Endpoints
 POST /predict                 submit an image + deadline_ms (from acceptance)
 GET  /orders/{order_id}       query status / result by order id
 POST /orders/{order_id}/cancel  cancel a queued or in-flight order
+POST /drain                   stop accepting traffic; report settled backlog
+GET  /drain                   read drain progress / safe-to-shutdown signal
 GET  /stats                   capacity and state counters (demo/observability)
 GET  /health                  liveness
 Interactive docs are served at /docs (Swagger UI).
@@ -17,7 +19,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 
 from .config import Settings
-from .engine import COMPLETED, BatchEngine, Order
+from .engine import COMPLETED, BatchEngine, DrainingError, Order
 from .preprocessing import preprocess
 
 
@@ -56,16 +58,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "Time-limited image classification for multiple cameras. "
             "Single-process micro-batching: at most 16 queued/in-flight images, "
             "batches of up to 4, idle model waits up to 50 ms to fill a batch, "
-            "one batch infers at a time. Cancelled/expired orders never yield results."
+            "one batch infers at a time. Cancelled/expired orders never yield results. "
+            "POST /drain stops new submissions (503) and reports when every accepted "
+            "frame is settled and no model compute is running."
         ),
         lifespan=lifespan,
     )
     app.state.engine = engine
     app.state.settings = settings
 
-    @app.post("/predict", status_code=201)
+    @app.post(
+        "/predict",
+        status_code=201,
+        responses={
+            429: {"description": "Capacity full (16 queued/in-flight)"},
+            503: {"description": "Draining: no new submissions accepted"},
+        },
+    )
     async def predict(file: UploadFile = File(...), deadline_ms: int = Form(...)):
         """Submit an image with a deadline in milliseconds counted from acceptance."""
+        if engine.draining:
+            # Fast path; engine.submit() re-checks atomically below, so a
+            # submission racing with POST /drain can never be accepted after
+            # the drain flag is set.
+            raise HTTPException(503, "engine is draining; new submissions are rejected")
         if deadline_ms <= 0:
             raise HTTPException(400, "deadline_ms must be a positive integer")
         data = await file.read()
@@ -73,13 +89,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             tensor = preprocess(data)
         except ValueError as exc:
             raise HTTPException(400, f"invalid image: {exc}") from exc
-        order = engine.submit(tensor, deadline_ms)
+        try:
+            order = engine.submit(tensor, deadline_ms)
+        except DrainingError as exc:
+            raise HTTPException(503, str(exc)) from exc
         if order is None:
             raise HTTPException(
                 429,
                 f"capacity full: at most {engine.max_capacity} images queued or in-flight",
             )
         return order_view(order)
+
+    @app.post("/drain")
+    async def start_drain():
+        """Stop accepting new frames; idempotent on repeat calls."""
+        return engine.drain()
+
+    @app.get("/drain")
+    async def drain_status():
+        """Backlog and safe-to-shutdown signal (also usable before draining)."""
+        return engine.drain_status()
 
     @app.get("/orders/{order_id}")
     async def get_order(order_id: str):
